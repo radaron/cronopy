@@ -1,16 +1,4 @@
-.DEFAULT_GOAL := help
-PART ?= patch
-
-.PHONY: help format check-format lint test check bump build
-
-help:
-	@echo "format        - ruff format + autofix imports/lint"
-	@echo "check-format  - ruff format --check (no changes)"
-	@echo "lint          - ruff check + ty check"
-	@echo "test          - pytest"
-	@echo "check         - check-format + lint + test"
-	@echo "build         - build sdist + wheel into dist/"
-	@echo "bump          - bump version (PART=patch|minor|major, default patch)"
+.PHONY: test
 
 format:
 	uv run ruff format .
@@ -26,11 +14,5 @@ lint:
 test:
 	uv run pytest
 
-check: check-format lint test
-
-build:
-	rm -rf dist
-	uv build
-
 bump:
-	uv version --bump $(PART)
+	uv version --bump $(filter-out $@,$(MAKECMDGOALS))

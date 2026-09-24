@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from enum import StrEnum
 from typing import Any
 
 import httpx
@@ -16,6 +17,12 @@ GWT_SERVICE = "com.cronometer.shared.rpc.CronometerService"
 log = logging.getLogger("cronopy.client")
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:155.0) Gecko/20100101 Firefox/155.0"
+
+
+class Source(StrEnum):
+    """Food source filter accepted by the search endpoint."""
+
+    ALL = "All"
 
 
 class CronometerError(Exception):
@@ -31,7 +38,27 @@ class NotAuthenticatedError(CronometerError):
 
 
 class CronometerClient:
-    def __init__(self, session: Session | None = None, timeout: float = 30.0) -> None:
+    """Client for the Cronometer web API.
+
+    Authenticate either with a previously saved ``session`` or with
+    ``email``/``password``. With credentials, login happens lazily on the
+    first call that needs a session. An expired session raises
+    :class:`NotAuthenticatedError`; the caller decides whether to ``login()``
+    again.
+    """
+
+    def __init__(
+        self,
+        session: Session | None = None,
+        *,
+        email: str | None = None,
+        password: str | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        if (email is None) != (password is None):
+            raise ValueError("email and password must be given together")
+        self._email = email
+        self._password = password
         self._http = httpx.Client(
             base_url=BASE_URL,
             timeout=timeout,
@@ -126,9 +153,17 @@ class CronometerClient:
         )
         return self.session
 
+    @property
+    def has_credentials(self) -> bool:
+        return self._email is not None and self._password is not None
+
     def _require_session(self) -> Session:
+        if self.session is None and self.has_credentials:
+            return self.login()
         if self.session is None:
-            raise NotAuthenticatedError("Not logged in. Run `crono login` first.")
+            raise NotAuthenticatedError(
+                "Not logged in. Pass a session or email/password, or run `crono login`."
+            )
         return self.session
 
     def _gwt_hashes(self) -> tuple[str, str]:
@@ -160,7 +195,11 @@ class CronometerClient:
         )
         return resp.text
 
-    def login(self, email: str, password: str) -> Session:
+    def login(self) -> Session:
+        """Authenticate with the constructor credentials and return the new session."""
+        email, password = self._email, self._password
+        if email is None or password is None:
+            raise LoginError("No credentials: construct the client with email and password")
         self._http.cookies.clear()
         self._http.get("/login/")
 
@@ -226,7 +265,7 @@ class CronometerClient:
         self,
         query: str,
         max_results: int = 50,
-        sources: str = "All",
+        sources: Source = Source.ALL,
     ) -> Any:
         session = self._require_session()
         resp = self._http.get(
@@ -234,13 +273,13 @@ class CronometerClient:
             params={
                 "query": query,
                 "maxResults": max_results,
-                "sources": sources,
+                "sources": Source(sources).value,
                 "categoryId": 0,
                 "selectedTab": "ALL",
                 "type": "All",
             },
         )
         if resp.status_code in (401, 403):
-            raise NotAuthenticatedError("Session expired. Run `crono login` again.")
+            raise NotAuthenticatedError("Session expired. Log in again.")
         resp.raise_for_status()
         return resp.json()

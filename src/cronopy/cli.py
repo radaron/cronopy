@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from cronopy.client import CronometerClient, CronometerError, NotAuthenticatedError
+from cronopy.client import CronometerClient, CronometerError, NotAuthenticatedError, Source
 from cronopy.session import default_session_path, delete_session, load_session, save_session
 
 app = typer.Typer(
@@ -66,9 +66,9 @@ def _client_from_disk() -> CronometerClient:
 
 @app.command()
 def login(
-    username: Annotated[
+    email: Annotated[
         str,
-        typer.Option("--username", "-u", prompt=True, help="Cronometer account email."),
+        typer.Option("--email", "-e", prompt=True, help="Cronometer account email."),
     ],
     password: Annotated[
         str,
@@ -83,8 +83,8 @@ def login(
 ) -> None:
     """Log in and store the session for later commands."""
     try:
-        with CronometerClient() as client:
-            session = client.login(username, password)
+        with CronometerClient(email=email, password=password) as client:
+            session = client.login()
     except CronometerError as exc:
         _fail(str(exc))
     path = save_session(session)
@@ -124,8 +124,8 @@ def search(
     query: Annotated[str, typer.Argument(help="Food name to search for.")],
     limit: Annotated[int, typer.Option("--limit", "-n", min=1, max=200, help="Max results.")] = 25,
     sources: Annotated[
-        str, typer.Option(help="Cronometer source filter, e.g. All, Custom.")
-    ] = "All",
+        Source, typer.Option("--sources", "-s", help="Cronometer source filter.")
+    ] = Source.ALL,
     as_json: Annotated[
         bool, typer.Option("--json", help="Print raw JSON instead of a table.")
     ] = False,

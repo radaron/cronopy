@@ -2,7 +2,7 @@ name: Deploy cronopy
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - pyproject.toml
   workflow_dispatch:
@@ -50,19 +50,15 @@ jobs:
     name: Publish to PyPI
     needs: [check-format, lint, test]
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/cronopy/
     permissions:
       contents: read
-      id-token: write   # PyPI trusted publishing (OIDC), no API token needed
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: make build
-      # --check-url skips files already on PyPI, so a pyproject.toml change
-      # that does not bump the version is a no-op instead of a failure.
+      - run: uv build
       - run: uv publish --check-url https://pypi.org/simple/
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.CRONOPY_PYPI_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: dist
