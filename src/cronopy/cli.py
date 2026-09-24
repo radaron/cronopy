@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 from typing import Annotated
@@ -11,7 +12,8 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from cronopy.client import CronometerClient, CronometerError, NotAuthenticatedError, Source
+from cronopy.client import CronometerClient, CronometerError, NotAuthenticatedError
+from cronopy.models import Source
 from cronopy.session import default_session_path, delete_session, load_session, save_session
 
 app = typer.Typer(
@@ -163,6 +165,52 @@ def search(
             str(item.get("source", "")),
             str(item.get("measureDisplayName", "")),
         )
+    console.print(table)
+
+
+@app.command()
+def calories(
+    date: Annotated[
+        dt.datetime | None,
+        typer.Option(
+            "--date", "-d", formats=["%Y-%m-%d"], help="Day to report (YYYY-MM-DD, default today)."
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print raw JSON instead of a table.")
+    ] = False,
+) -> None:
+    """Show calories consumed, burned and remaining for a day."""
+    day = date.date() if date else dt.date.today()
+    try:
+        with _client_from_disk() as client:
+            summary = client.get_calories(day)
+            if (updated := client.refresh_session()) is not None:
+                save_session(updated)
+    except NotAuthenticatedError as exc:
+        _fail(str(exc))
+    except CronometerError as exc:
+        _fail(str(exc))
+
+    if as_json:
+        console.print_json(json.dumps(summary.to_dict()))
+        return
+
+    table = Table(title=f"Calories for {day.isoformat()}", show_header=False)
+    table.add_column("Metric")
+    table.add_column("kcal", justify="right")
+    table.add_row("Consumed", f"{summary.consumed:.0f}")
+    table.add_row("Burned", f"{summary.burned:.0f}")
+    table.add_row("  BMR", f"[dim]{summary.bmr:.0f}[/dim]")
+    table.add_row("  Activity", f"[dim]{summary.activity:.0f}[/dim]")
+    table.add_row("  Exercise", f"[dim]{summary.exercise:.0f}[/dim]")
+    if summary.custom_target is not None:
+        table.add_row("Custom target", f"{summary.custom_target:.0f}")
+    else:
+        table.add_row("Weight goal", f"{summary.weight_goal_adjustment:+.0f}")
+    table.add_row("Target", f"{summary.target:.0f}")
+    style = "green" if summary.remaining >= 0 else "red"
+    table.add_row("[bold]Remaining[/bold]", f"[bold {style}]{summary.remaining:.0f}[/bold {style}]")
     console.print(table)
 
 

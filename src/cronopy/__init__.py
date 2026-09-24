@@ -1,12 +1,7 @@
 """Unofficial cli for cronometer."""
 
-from cronopy.client import (
-    CronometerClient,
-    CronometerError,
-    LoginError,
-    NotAuthenticatedError,
-    Source,
-)
+from cronopy.client import CronometerClient, CronometerError, LoginError, NotAuthenticatedError
+from cronopy.models import CalorieSummary, Source
 from cronopy.session import (
     Session,
     default_session_path,
@@ -16,6 +11,7 @@ from cronopy.session import (
 )
 
 __all__ = [
+    "CalorieSummary",
     "CronometerClient",
     "CronometerError",
     "LoginError",

@@ -14,6 +14,8 @@ uv sync
 crono login -e you@example.com      # password is prompted (or pass -p)
 crono search "chili" -n 10          # table output
 crono search "chili" --json         # raw JSON
+crono calories                      # consumed / burned / remaining for today
+crono calories -d 2026-09-20 --json # another day, raw JSON
 crono whoami
 crono logout
 ```
@@ -32,6 +34,8 @@ from cronopy import CronometerClient
 
 with CronometerClient(email="you@example.com", password="...") as client:
     results = client.search("chili", max_results=10)
+    today = client.get_calories()  # CalorieSummary for today
+    print(today.consumed, today.target, today.remaining)  # target = burned + weight goal
 ```
 
 With a saved session (for example the one written by `crono login`):

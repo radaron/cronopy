@@ -2,27 +2,27 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import re
-from enum import StrEnum
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
+from cronopy import gwt
+from cronopy.gwt import BASE_URL, Boxed, GwtParam
+from cronopy.models import CalorieSummary, Source
 from cronopy.session import Session
 
-BASE_URL = "https://cronometer.com"
-GWT_MODULE_BASE = f"{BASE_URL}/cronometer/"
-GWT_SERVICE = "com.cronometer.shared.rpc.CronometerService"
+# Cronometer stores the weight goal (``weightGoal`` preference) in lb/week and
+# converts it to a daily energy adjustment as its web UI does:
+GRAMS_PER_LB = 453.59237
+KCAL_PER_GRAM_BODY_WEIGHT = 7.7  # the usual 7700 kcal/kg rule of thumb
+KCAL_PER_LB_PER_WEEK = GRAMS_PER_LB * KCAL_PER_GRAM_BODY_WEIGHT / 7  # ~499 kcal/day per lb/week
 log = logging.getLogger("cronopy.client")
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:155.0) Gecko/20100101 Firefox/155.0"
-
-
-class Source(StrEnum):
-    """Food source filter accepted by the search endpoint."""
-
-    ALL = "All"
 
 
 class CronometerError(Exception):
@@ -189,11 +189,33 @@ class CronometerClient:
             content=payload,
             headers={
                 "Content-Type": "text/x-gwt-rpc; charset=UTF-8",
-                "X-GWT-Module-Base": GWT_MODULE_BASE,
+                "X-GWT-Module-Base": gwt.MODULE_BASE,
                 "X-GWT-Permutation": permutation,
             },
         )
         return resp.text
+
+    def _gwt_rpc(
+        self, method: str, *params: GwtParam, hashes: tuple[str, str] | None = None
+    ) -> str:
+        """Invoke ``CronometerService.<method>(*params)`` and return the raw response body.
+
+        ``hashes`` (permutation, policy) can be passed to reuse them across
+        several calls; otherwise they are fetched.
+        """
+        permutation, policy_hash = hashes or self._gwt_hashes()
+        payload = gwt.encode_request(policy_hash, method, *params)
+        return self._gwt_call(payload, permutation)
+
+    @staticmethod
+    def _gwt_decode[T](decode: Callable[[str], T], body: str) -> T:
+        """Run a ``cronopy.gwt`` decoder, mapping its errors onto client errors."""
+        try:
+            return decode(body)
+        except gwt.GwtServerError as exc:
+            raise CronometerError(f"GWT call failed: {exc}") from exc
+        except gwt.GwtProtocolError as exc:
+            raise NotAuthenticatedError("Session expired. Log in again.") from exc
 
     def login(self) -> Session:
         """Authenticate with the constructor credentials and return the new session."""
@@ -231,17 +253,13 @@ class CronometerClient:
             raise LoginError("Login failed: no session cookie returned (bad credentials?)")
 
         self._http.get("/")
-        permutation, policy_hash = self._gwt_hashes()
-        auth_rpc = (
-            f"7|0|5|{GWT_MODULE_BASE}|{policy_hash}|{GWT_SERVICE}|authenticate|"
-            f"java.lang.Integer/3438268394|1|2|3|4|1|5|5|120|"
-        )
-        body = self._gwt_call(auth_rpc, permutation)
-        m = re.search(r"//OK\[(\d+),", body)
-        if not m:
-            raise LoginError(f"GWT authenticate failed: {body[:200]}")
+        body = self._gwt_rpc("authenticate", Boxed(120))
+        try:
+            user_id = gwt.decode_int(body)
+        except gwt.GwtError as exc:
+            raise LoginError(f"GWT authenticate failed: {exc}") from exc
 
-        self.session = self._snapshot(email, int(m.group(1)))
+        self.session = self._snapshot(email, user_id)
         log.debug(
             "authenticated user_id=%s cookies=%s", self.session.user_id, list(self.session.cookies)
         )
@@ -249,17 +267,78 @@ class CronometerClient:
 
     def logout(self) -> None:
         session = self._require_session()
-        sesnonce = self._http.cookies.get("sesnonce") or session.cookies.get("sesnonce", "")
         try:
-            permutation, policy_hash = self._gwt_hashes()
-            payload = (
-                f"7|0|6|{GWT_MODULE_BASE}|{policy_hash}|{GWT_SERVICE}|logout|"
-                f"java.lang.String/2004016611|{sesnonce}|1|2|3|4|1|5|6|"
-            )
-            self._gwt_call(payload, permutation)
+            self._gwt_rpc("logout", self._sesnonce(session))
         finally:
             self._http.cookies.clear()
             self.session = None
+
+    def _sesnonce(self, session: Session) -> str:
+        return self._http.cookies.get("sesnonce") or session.cookies.get("sesnonce", "")
+
+    def _gwt_get_preference(self, key: str, sesnonce: str, hashes: tuple[str, str]) -> str | None:
+        """Call the ``getPreference`` GWT-RPC; ``None`` when the key is unset."""
+        body = self._gwt_rpc("getPreference", sesnonce, key, hashes=hashes)
+        return self._gwt_decode(gwt.decode_string, body)
+
+    def get_preference(self, key: str) -> str | None:
+        """Return a raw Cronometer user preference (e.g. ``weightGoal``), or ``None``."""
+        session = self._require_session()
+        return self._gwt_get_preference(key, self._sesnonce(session), self._gwt_hashes())
+
+    def get_calories(self, day: dt.date | None = None) -> CalorieSummary:
+        """Return the energy balance (consumed, burned, target, remaining) for ``day``.
+
+        Defaults to today. Uses the ``getCaloriesConsumedAndBurned`` GWT-RPC
+        the web diary uses (end day exclusive server-side) plus the
+        ``weightGoal`` and ``targets.custom.energy.target`` preferences.
+        """
+        session = self._require_session()
+        day = day or dt.date.today()
+        sesnonce = self._sesnonce(session)
+        hashes = self._gwt_hashes()
+
+        weight_goal = self._gwt_get_preference("weightGoal", sesnonce, hashes)
+        adjustment = round(float(weight_goal) * KCAL_PER_LB_PER_WEEK) if weight_goal else 0.0
+        custom = self._gwt_get_preference("targets.custom.energy.target", sesnonce, hashes)
+        custom_target = float(custom) if custom else None
+
+        body = self._gwt_rpc(
+            "getCaloriesConsumedAndBurned",
+            sesnonce,
+            session.user_id,
+            day,
+            day + dt.timedelta(days=1),
+            hashes=hashes,
+        )
+        tokens = self._gwt_decode(gwt.decode_response, body)
+        # Wire order is reversed: [..values.., 12, <type>, <rows>, <type>, [strings], 0, 7].
+        # An empty diary day yields zero rows.
+        rows = tokens[-5]
+        if rows == 0:
+            return CalorieSummary(
+                day=day,
+                consumed=0.0,
+                bmr=0.0,
+                activity=0.0,
+                exercise=0.0,
+                tef=0.0,
+                weight_goal_adjustment=adjustment,
+                custom_target=custom_target,
+            )
+        values = tokens[:12][::-1]
+        if len(values) != 12:
+            raise CronometerError(f"Unexpected calories response: {tokens!r}")
+        return CalorieSummary(
+            day=day,
+            consumed=float(values[0]),
+            exercise=abs(float(values[1])),
+            bmr=float(values[3]),
+            tef=float(values[4]),
+            activity=float(values[9]) + float(values[10]),
+            weight_goal_adjustment=adjustment,
+            custom_target=custom_target,
+        )
 
     def search(
         self,
