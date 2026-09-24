@@ -370,13 +370,22 @@ class CronometerClient:
                     return int(data[key])
         raise CronometerError(f"{endpoint} returned no entry id: {data!r}")
 
-    def _delete_entries(self, entries: list[dict[str, Any]]) -> None:
-        """Delete diary entries of any type via the v3 endpoint.
+    @staticmethod
+    def _deletable(entry: dict[str, Any]) -> dict[str, Any]:
+        """Shape a ``get_diary`` entry for the v3 delete endpoint.
 
-        The v3 deserializer rejects the ``meta`` object that ``get_diary``
-        attaches to biometric and exercise entries, so it is stripped.
+        The deserializer rejects the ``meta`` object attached to biometric and
+        exercise entries, and it identifies biometrics by ``id`` rather than
+        ``biometricId`` (a 204 without ``id`` deletes nothing).
         """
-        body = {"diaryEntries": [{k: v for k, v in e.items() if k != "meta"} for e in entries]}
+        body = {k: v for k, v in entry.items() if k != "meta"}
+        if entry.get("type") == "Biometric" and "biometricId" in entry:
+            body["id"] = entry["biometricId"]
+        return body
+
+    def _delete_entries(self, entries: list[dict[str, Any]]) -> None:
+        """Delete diary entries of any type via the v3 endpoint."""
+        body = {"diaryEntries": [self._deletable(e) for e in entries]}
         resp = self._v3("DELETE", "/diary-entries", json_body=body)
         if resp.status_code not in (200, 204):
             raise CronometerError(f"Delete failed with HTTP {resp.status_code}: {resp.text[:300]}")

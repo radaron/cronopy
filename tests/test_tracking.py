@@ -222,6 +222,8 @@ def test_remove_entry_any_type_strips_meta(api, session, entry_id, kind):
         ).items()
         if k != "meta"
     }
+    if kind == "Biometric":
+        expected["id"] = entry_id  # v3 identifies biometrics by ``id``
     assert sent[0] == expected
     assert route.calls[0].request.headers["x-crono-session"] == TOKEN
 

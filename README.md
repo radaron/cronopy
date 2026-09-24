@@ -94,6 +94,20 @@ with CronometerClient(load_session(), email="you@example.com", password="...") a
         results = client.search("chili")
 ```
 
+## Development
+
+```sh
+make test      # unit tests (mocked HTTP)
+make lint      # ruff + ty
+make live      # integration tests against the real API
+```
+
+`make live` uses `CRONOMETER_EMAIL` / `CRONOMETER_PASSWORD` (and
+`CRONOMETER_TOTP_SECRET` for 2FA), or the session saved by `crono login` when
+those are unset. It logs a weight, an exercise and a food serving on
+1900-01-02 and deletes them again. The "Live API check" GitHub workflow runs
+it daily from the repository secrets of the same names.
+
 ## Endpoints used
 
 | Call | Endpoint |
@@ -105,7 +119,7 @@ with CronometerClient(load_session(), email="you@example.com", password="...") a
 | add food | `POST /api/v2/add_serving` |
 | add biometric | `POST /api/v2/add_biometric` |
 | add exercise | `POST /api/v2/add_exercise` |
-| remove entry | `DELETE /api/v3/user/{id}/diary-entries` (any entry type; `meta` must be stripped) |
+| remove entry | `DELETE /api/v3/user/{id}/diary-entries` (any type; strip `meta`, biometrics need `id`) |
 | metrics, history | `POST /api/v2/get_metrics`, `POST /api/v2/get_biometrics` |
 | activities | `POST /api/v2/find_activity` |
 | weight goal | `POST /api/v2/get_profile` (`prefs`: `weightGoal` lb/week, `wgkg` target) |

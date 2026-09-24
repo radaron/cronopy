@@ -1,4 +1,4 @@
-.PHONY: test
+.PHONY: test live
 
 format:
 	uv run ruff format .
@@ -12,7 +12,10 @@ lint:
 	uv run ty check
 
 test:
-	uv run pytest
+	uv run pytest -v
+
+live:
+	uv run pytest tests/live -m live -o addopts='' -v
 
 bump:
 	uv version --bump $(filter-out $@,$(MAKECMDGOALS))

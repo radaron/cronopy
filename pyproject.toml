@@ -59,7 +59,7 @@ ignore = [
 ban-relative-imports = "all"
 
 [tool.ruff.lint.isort]
-known-first-party = ["cronopy", "conftest"]
+known-first-party = ["cronopy", "conftest", "live"]
 combine-as-imports = true
 split-on-trailing-comma = false
 
@@ -75,4 +75,5 @@ include = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not live'"
+markers = ["live: hits the real Cronometer API (needs CRONOMETER_EMAIL/PASSWORD)"]

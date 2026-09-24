@@ -1,0 +1,30 @@
+name: Live API check
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # daily, 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-api
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - name: Run live integration tests
+        env:
+          CRONOMETER_EMAIL: ${{ secrets.CRONOMETER_EMAIL }}
+          CRONOMETER_PASSWORD: ${{ secrets.CRONOMETER_PASSWORD }}
+          CRONOMETER_TOTP_SECRET: ${{ secrets.CRONOMETER_TOTP_SECRET }}
+        run: make live
