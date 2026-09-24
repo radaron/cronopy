@@ -1,30 +1,42 @@
-"""Minimal unofficial client for the Cronometer web API."""
-
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import re
-from collections.abc import Callable
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from cronopy import gwt
-from cronopy.gwt import BASE_URL, Boxed, GwtObject, GwtParam, Long
-from cronopy.models import CalorieSummary, DiaryEntry, DiaryGroup, FoodInfo, Measure, Source
-from cronopy.session import Session
+from cronopy.enums import DiaryGroup, Source
+from cronopy.models import (
+    METRIC_BODY_FAT,
+    METRIC_WEIGHT,
+    UNIT_KG,
+    UNIT_PERCENT,
+    Activity,
+    BiometricEntry,
+    BiometricPoint,
+    CalorieSummary,
+    DayDiary,
+    DiaryEntry,
+    ExerciseEntry,
+    FoodInfo,
+    Metric,
+    Session,
+    WeightGoal,
+)
+from cronopy.util import format_day, parse_day, parse_time, totp_code
 
-# Cronometer stores the weight goal (``weightGoal`` preference) in lb/week and
-# converts it to a daily energy adjustment as its web UI does:
-GRAMS_PER_LB = 453.59237
-KCAL_PER_GRAM_BODY_WEIGHT = 7.7  # the usual 7700 kcal/kg rule of thumb
-KCAL_PER_LB_PER_WEEK = GRAMS_PER_LB * KCAL_PER_GRAM_BODY_WEIGHT / 7  # ~499 kcal/day per lb/week
 log = logging.getLogger("cronopy.client")
 
-FOODS_PER_REQUEST = 25  # getAllFood rejects larger batches ("Too many food IDs requested")
+BASE_URL = "https://mobile.cronometer.com"
+USER_AGENT = "Dart/3.9 (dart:io)"
 
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:155.0) Gecko/20100101 Firefox/155.0"
+APP_BUILD = "2807"
+APP_VERSION = "4.48.2"
+
+_APP_AUTH = {"api": 3, "os": "Android", "build": APP_BUILD, "flavour": "free"}
 
 
 class CronometerError(Exception):
@@ -36,17 +48,18 @@ class LoginError(CronometerError):
 
 
 class NotAuthenticatedError(CronometerError):
-    """Raised when an action requires a session but none is available."""
+    """Raised when an action requires a session but none is available or it expired."""
 
 
 class CronometerClient:
-    """Client for the Cronometer web API.
+    """Client for the Cronometer mobile API.
 
     Authenticate either with a previously saved ``session`` or with
-    ``email``/``password``. With credentials, login happens lazily on the
-    first call that needs a session. An expired session raises
-    :class:`NotAuthenticatedError`; the caller decides whether to ``login()``
-    again.
+    ``email``/``password`` (plus ``totp_secret`` for accounts with 2FA). With
+    credentials, login happens lazily on the first call that needs a session.
+    An expired session raises :class:`NotAuthenticatedError`; the caller
+    decides whether to ``login()`` again. Cronometer rate-limits logins, so
+    reuse sessions whenever possible.
     """
 
     def __init__(
@@ -55,57 +68,44 @@ class CronometerClient:
         *,
         email: str | None = None,
         password: str | None = None,
+        totp_secret: str | None = None,
         timeout: float = 30.0,
     ) -> None:
         if (email is None) != (password is None):
             raise ValueError("email and password must be given together")
         self._email = email
         self._password = password
+        self._totp_secret = totp_secret
+        self.session: Session | None = session
         self._http = httpx.Client(
             base_url=BASE_URL,
             timeout=timeout,
-            headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
+            headers={
+                "user-agent": USER_AGENT,
+                "content-type": "text/plain; charset=utf-8",
+                "accept-encoding": "gzip",
+            },
             event_hooks={"request": [self._log_request], "response": [self._log_response]},
         )
-        self.session: Session | None = None
-        if session is not None:
-            self._restore(session)
 
     @staticmethod
     def _log_request(request: httpx.Request) -> None:
         if not log.isEnabledFor(logging.DEBUG):
             return
         log.debug("--> %s %s", request.method, request.url)
-        for k, v in request.headers.items():
-            if k.lower() == "cookie":
-                v = f"<{len(v)} bytes>"
-            log.debug("    %s: %s", k, v)
         if request.content:
             body = request.content.decode("utf-8", "replace")
-            body = re.sub(r"(password=)[^&]*", r"\1***", body)
+            body = re.sub(r'("(?:password|token)":\s*")[^"]*', r"\1***", body)
             log.debug("    body: %s", body[:1000])
 
     @staticmethod
     def _log_response(response: httpx.Response) -> None:
         if not log.isEnabledFor(logging.DEBUG):
             return
-        log.debug(
-            "<-- %s %s (%s)",
-            response.status_code,
-            response.url,
-            response.headers.get("content-type", ""),
-        )
-        for k, v in response.headers.multi_items():
-            if k.lower() == "set-cookie":
-                log.debug("    set-cookie: %s", v.split(";", 1)[0])
+        log.debug("<-- %s %s", response.status_code, response.url)
         if not response.is_stream_consumed:
             response.read()
-        text = response.text
-        if "javascript" in response.headers.get("content-type", ""):
-            log.debug("    body: <%d bytes of js>", len(text))
-        else:
-            log.debug("    body: %s", text[:1000])
+        log.debug("    body: %s", response.text[:1000])
 
     def __enter__(self) -> CronometerClient:
         return self
@@ -116,44 +116,9 @@ class CronometerClient:
     def close(self) -> None:
         self._http.close()
 
-    def _restore(self, session: Session) -> None:
-        self.session = session
-        log.debug("restoring session user_id=%s cookies=%s", session.user_id, list(session.cookies))
-        for name, value in session.cookies.items():
-            self._http.cookies.set(name, value, domain="cronometer.com", path="/")
-
-    def _snapshot(self, email: str | None, user_id: int) -> Session:
-        return Session(
-            user_id=user_id,
-            email=email,
-            cookies={name: value for name, value in self._http.cookies.items()},
-        )
-
     @property
     def is_authenticated(self) -> bool:
         return self.session is not None
-
-    def refresh_session(self) -> Session | None:
-        """Sync the live cookie jar back into ``self.session``.
-
-        Returns the updated session if any cookie changed (e.g. the AWS ALB
-        stickiness cookie is re-issued on every response), otherwise ``None``.
-        """
-        if self.session is None:
-            return None
-        current = {name: value for name, value in self._http.cookies.items()}
-        if current == self.session.cookies:
-            return None
-        changed = sorted(
-            k
-            for k in set(current) | set(self.session.cookies)
-            if current.get(k) != self.session.cookies.get(k)
-        )
-        log.debug("session cookies changed: %s", changed)
-        self.session = Session(
-            user_id=self.session.user_id, email=self.session.email, cookies=current
-        )
-        return self.session
 
     @property
     def has_credentials(self) -> bool:
@@ -168,255 +133,270 @@ class CronometerClient:
             )
         return self.session
 
-    def _gwt_hashes(self) -> tuple[str, str]:
-        """Fetch the current GWT permutation and RPC policy hash.
-
-        These change with every frontend deploy, so they are never persisted.
-        """
-        nocache = self._http.get("/cronometer/cronometer.nocache.js").text
-        m = re.search(r"'([0-9A-F]{32})'", nocache)
-        if not m:
-            raise CronometerError("Could not find GWT permutation hash")
-        permutation = m.group(1)
-        cache_js = self._http.get(f"/cronometer/{permutation}.cache.js").text
-        m = re.search(r"'app','([0-9A-F]{32})'", cache_js)
-        if not m:
-            raise CronometerError("Could not find GWT policy hash")
-        log.debug("gwt permutation=%s policy_hash=%s", permutation, m.group(1))
-        return permutation, m.group(1)
-
-    def _gwt_call(self, payload: str, permutation: str) -> str:
-        resp = self._http.post(
-            "/cronometer/app",
-            content=payload,
-            headers={
-                "Content-Type": "text/x-gwt-rpc; charset=UTF-8",
-                "X-GWT-Module-Base": gwt.MODULE_BASE,
-                "X-GWT-Permutation": permutation,
-            },
-        )
-        return resp.text
-
-    def _gwt_rpc(
-        self, method: str, *params: GwtParam, hashes: tuple[str, str] | None = None
-    ) -> str:
-        """Invoke ``CronometerService.<method>(*params)`` and return the raw response body.
-
-        ``hashes`` (permutation, policy) can be passed to reuse them across
-        several calls; otherwise they are fetched.
-        """
-        permutation, policy_hash = hashes or self._gwt_hashes()
-        payload = gwt.encode_request(policy_hash, method, *params)
-        return self._gwt_call(payload, permutation)
-
-    @staticmethod
-    def _gwt_decode[T](decode: Callable[[str], T], body: str) -> T:
-        """Run a ``cronopy.gwt`` decoder, mapping its errors onto client errors."""
-        try:
-            return decode(body)
-        except gwt.GwtServerError as exc:
-            raise CronometerError(f"GWT call failed: {exc}") from exc
-        except gwt.GwtProtocolError as exc:
-            raise NotAuthenticatedError("Session expired. Log in again.") from exc
-
     def login(self) -> Session:
         """Authenticate with the constructor credentials and return the new session."""
         email, password = self._email, self._password
         if email is None or password is None:
             raise LoginError("No credentials: construct the client with email and password")
-        self._http.cookies.clear()
-        self._http.get("/login/")
-
-        # Double-submit cookie CSRF: the token is the name of a 32-char cookie.
-        csrf_token = next(
-            (name for name in self._http.cookies if len(name) == 32 and name.islower()),
-            None,
-        )
-        log.debug("csrf token cookie: %s", csrf_token)
-        if csrf_token is None:
-            raise LoginError("Could not find anti-CSRF cookie on login page")
-
-        resp = self._http.post(
-            "/login",
-            data={
-                "anticsrf": csrf_token,
-                "password": password,
-                "username": email,
-                "userCode": "",
+        payload = {
+            "email": email,
+            "password": password,
+            # Must stay null: a non-null timezone *overwrites* the account setting.
+            "timezone": None,
+            "userCode": totp_code(self._totp_secret) if self._totp_secret else None,
+            "build": f"{APP_VERSION} b{APP_BUILD}-a",
+            "device": "Android 14 (SDK 34), Google Pixel 6 Pro",
+            "firebaseToken": "",
+            "features": {
+                "food_search_config": '{"newSearch": true, "newSpellcheck": true}',
+                "use_gpt_autofill": "true",
             },
-            headers={
-                "Referer": f"{BASE_URL}/login/",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        )
+            "auth": {"userId": None, "token": None, **_APP_AUTH},
+            "lastSeen": 0,
+            "config": {"call_version": 2},
+        }
+        resp = self._http.post("/api/v2/login", json=payload)
         if resp.status_code >= 400:
             raise LoginError(f"Login request failed with HTTP {resp.status_code}")
-        if "sesnonce" not in self._http.cookies:
-            raise LoginError("Login failed: no session cookie returned (bad credentials?)")
-
-        self._http.get("/")
-        body = self._gwt_rpc("authenticate", Boxed(120))
         try:
-            user_id = gwt.decode_int(body)
-        except gwt.GwtError as exc:
-            raise LoginError(f"GWT authenticate failed: {exc}") from exc
-
-        self.session = self._snapshot(email, user_id)
-        log.debug(
-            "authenticated user_id=%s cookies=%s", self.session.user_id, list(self.session.cookies)
+            data = resp.json()
+        except ValueError as exc:
+            raise LoginError(f"Login returned non-JSON response: {resp.text[:200]}") from exc
+        if data.get("result") != "SUCCESS" and "sessionKey" not in data:
+            if data.get("error") == "TOTP_CODE_REQUIRED":
+                raise LoginError(
+                    "Login failed: the account has two-factor authentication enabled; "
+                    "pass the base32 TOTP secret shown when 2FA was set up"
+                )
+            raise LoginError(f"Login failed: {data.get('error') or data}")
+        timezone = data.get("timezone")
+        if isinstance(timezone, str) and timezone:
+            try:
+                ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                log.warning("Cronometer reported unknown timezone %r; ignoring", timezone)
+                timezone = None
+        else:
+            timezone = None
+        self.session = Session(
+            user_id=int(data["id"]), token=str(data["sessionKey"]), email=email, timezone=timezone
         )
+        log.debug("authenticated user_id=%s tz=%s", self.session.user_id, timezone)
         return self.session
 
     def logout(self) -> None:
-        session = self._require_session()
+        """Forget the session. The mobile API has no logout endpoint; tokens expire server-side."""
+        self.session = None
+
+    def tzinfo(self) -> dt.tzinfo | None:
+        """The account's timezone from the session, or ``None`` to use local time."""
+        timezone = self.session.timezone if self.session else None
+        if not timezone:
+            return None
         try:
-            self._gwt_rpc("logout", self._sesnonce(session))
-        finally:
-            self._http.cookies.clear()
-            self.session = None
+            return ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
 
-    def _sesnonce(self, session: Session) -> str:
-        return self._http.cookies.get("sesnonce") or session.cookies.get("sesnonce", "")
+    def now(self) -> dt.datetime:
+        """Current wall-clock time in the account's timezone (local time if unknown)."""
+        return dt.datetime.now(self.tzinfo())
 
-    def _gwt_get_preference(self, key: str, sesnonce: str, hashes: tuple[str, str]) -> str | None:
-        """Call the ``getPreference`` GWT-RPC; ``None`` when the key is unset."""
-        body = self._gwt_rpc("getPreference", sesnonce, key, hashes=hashes)
-        return self._gwt_decode(gwt.decode_string, body)
+    def today(self) -> dt.date:
+        return self.now().date()
 
-    def get_preference(self, key: str) -> str | None:
-        """Return a raw Cronometer user preference (e.g. ``weightGoal``), or ``None``."""
+    @staticmethod
+    def _expired() -> NotAuthenticatedError:
+        return NotAuthenticatedError("Session expired. Log in again.")
+
+    def _post(self, endpoint: str, payload: dict[str, Any]) -> Any:
+        """Send a v2 POST with the JSON auth block and return the decoded body."""
         session = self._require_session()
-        return self._gwt_get_preference(key, self._sesnonce(session), self._gwt_hashes())
+        body = {
+            **payload,
+            "auth": {"userId": session.user_id, "token": session.token, **_APP_AUTH},
+        }
+        body.setdefault("lastSeen", 0)
+        resp = self._http.post(endpoint, json=body)
+        if resp.status_code in (401, 403):
+            raise self._expired()
+        if resp.status_code >= 400:
+            raise CronometerError(f"{endpoint} failed with HTTP {resp.status_code}")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise CronometerError(f"{endpoint} returned non-JSON: {resp.text[:200]}") from exc
+        if isinstance(data, dict) and data.get("result") in ("FAIL", "FAILURE"):
+            error = str(data.get("error") or "")
+            if "auth" in error.lower() or "session" in error.lower() or "token" in error.lower():
+                raise self._expired()
+            raise CronometerError(f"{endpoint} failed: {error or data}")
+        return data
 
-    def get_calories(self, day: dt.date | None = None) -> CalorieSummary:
-        """Return the energy balance (consumed, burned, target, remaining) for ``day``.
+    def _v3(
+        self, method: str, path: str, *, json_body: dict[str, Any] | None = None
+    ) -> httpx.Response:
+        """Send a v3 REST request (header auth) under ``/api/v3/user/{id}``."""
+        session = self._require_session()
+        resp = self._http.request(
+            method,
+            f"/api/v3/user/{session.user_id}{path}",
+            json=json_body,
+            headers={
+                "x-crono-session": session.token,
+                "x-crono-app-os": "android",
+                "x-crono-app-build-number": APP_BUILD,
+                "x-crono-app-version": APP_VERSION,
+                "content-type": "application/json; charset=utf-8",
+            },
+        )
+        if resp.status_code in (401, 403):
+            raise self._expired()
+        return resp
 
-        Defaults to today. Uses the ``getCaloriesConsumedAndBurned`` GWT-RPC
-        the web diary uses (end day exclusive server-side) plus the
-        ``weightGoal`` and ``targets.custom.energy.target`` preferences.
+    def search(
+        self, query: str, max_results: int = 50, sources: Source = Source.ALL
+    ) -> list[dict[str, Any]]:
+        """Search foods, recipes and meals; returns the raw result objects.
+
+        Each has ``id``, ``name``, ``measureId``, ``measureDisplayName``,
+        ``source``, ``translationId`` and scoring fields.
         """
-        session = self._require_session()
-        day = day or dt.date.today()
-        sesnonce = self._sesnonce(session)
-        hashes = self._gwt_hashes()
-
-        weight_goal = self._gwt_get_preference("weightGoal", sesnonce, hashes)
-        adjustment = round(float(weight_goal) * KCAL_PER_LB_PER_WEEK) if weight_goal else 0.0
-        custom = self._gwt_get_preference("targets.custom.energy.target", sesnonce, hashes)
-        custom_target = float(custom) if custom else None
-
-        body = self._gwt_rpc(
-            "getCaloriesConsumedAndBurned",
-            sesnonce,
-            session.user_id,
-            day,
-            day + dt.timedelta(days=1),
-            hashes=hashes,
+        data = self._post(
+            "/api/v2/find_food",
+            {
+                "query": query,
+                "tab": "ALL",
+                "sources": [Source(sources).value],
+                "config": {"newSearch": True, "newSpellcheck": True, "call_version": 1},
+            },
         )
-        tokens = self._gwt_decode(gwt.decode_response, body)
-        # Wire order is reversed: [..values.., 12, <type>, <rows>, <type>, [strings], 0, 7].
-        # An empty diary day yields zero rows.
-        rows = tokens[-5]
-        if rows == 0:
-            return CalorieSummary(
-                day=day,
-                consumed=0.0,
-                bmr=0.0,
-                activity=0.0,
-                exercise=0.0,
-                tef=0.0,
-                weight_goal_adjustment=adjustment,
-                custom_target=custom_target,
-            )
-        values = tokens[:12][::-1]
-        if len(values) != 12:
-            raise CronometerError(f"Unexpected calories response: {tokens!r}")
-        return CalorieSummary(
-            day=day,
-            consumed=float(values[0]),
-            exercise=abs(float(values[1])),
-            bmr=float(values[3]),
-            tef=float(values[4]),
-            activity=float(values[9]) + float(values[10]),
-            weight_goal_adjustment=adjustment,
-            custom_target=custom_target,
+        foods = data.get("foods", []) if isinstance(data, dict) else []
+        return foods[:max_results]
+
+    def get_foods(self, food_ids: list[int]) -> dict[int, FoodInfo]:
+        """Fetch several foods (measures and per-100 g nutrients) in one call."""
+        unique = list(dict.fromkeys(food_ids))
+        if not unique:
+            return {}
+        data = self._post("/api/v2/get_foods", {"ids": unique, "config": {"call_version": 1}})
+        foods = data.get("foods", []) if isinstance(data, dict) else []
+        infos = (FoodInfo.from_api(f) for f in foods if isinstance(f, dict) and "id" in f)
+        return {info.id: info for info in infos}
+
+    def get_food(self, food_id: int) -> FoodInfo:
+        data = self._post("/api/v2/get_food", {"id": food_id, "config": {"call_version": 1}})
+        if not isinstance(data, dict) or data.get("id") is None:
+            raise CronometerError(f"Food {food_id} not found")
+        return FoodInfo.from_api(data)
+
+    def get_diary_raw(self, day: dt.date | None = None) -> dict[str, Any]:
+        """Return the full ``get_diary`` response (entries plus ``summary``)."""
+        day = day or self.today()
+        data = self._post(
+            "/api/v2/get_diary", {"day": format_day(day), "config": {"call_version": 1}}
         )
+        return data if isinstance(data, dict) else {}
 
     @staticmethod
-    def _read_serving(reader: gwt.GwtReader) -> DiaryEntry:
-        """Read one ``Serving`` whose type token has just been consumed."""
-        reader.read()  # Day type
-        d, m, y = reader.read(), reader.read(), reader.read()
-        reader.read()  # boolean
-        reader.read()  # boolean
-        reader.skip_object_ref()  # nullable Short
-        packed = reader.read()  # group << 16 | order
-        reader.read()  # Time type
-        hh, mm, ss = reader.read(), reader.read(), reader.read()
-        user_id = reader.read()
-        amount = float(reader.read())
-        food_id = reader.read()
-        entry_id = reader.read_long()
-        measure_id = reader.read()
-        reader.read()
-        reader.read()
-        return DiaryEntry(
-            id=entry_id,
-            day=dt.date(y, m, d),
-            time=dt.time(hh, mm, ss),
-            group=DiaryGroup(packed >> 16),
-            order=packed & 0xFFFF,
-            food_id=food_id,
-            measure_id=measure_id,
-            amount=amount,
-            user_id=user_id,
-        )
-
-    @classmethod
-    def _servings_in(cls, body: str) -> list[DiaryEntry]:
-        """Extract every ``Serving`` object from a response, regardless of its container."""
-        reader = cls._gwt_decode(gwt.GwtReader, body)
-        serving = reader.type_index(gwt.TYPE_SERVING)
-        day = reader.type_index(gwt.TYPE_DAY)
-        if serving is None or day is None:
-            return []
-        entries = []
-        while reader.pos < len(reader.tokens) - 1:
-            if reader.tokens[reader.pos] == serving and reader.tokens[reader.pos + 1] == day:
-                reader.read()
-                entries.append(cls._read_serving(reader))
-            else:
-                reader.pos += 1
-        return entries
-
-    @staticmethod
-    def _serving_object(entry: DiaryEntry) -> GwtObject:
-        packed = (int(entry.group) << 16) | (entry.order & 0xFFFF)
-        return GwtObject(
-            gwt.TYPE_SERVING,
-            (
-                entry.day,
-                True,
-                True,
-                None,
-                packed,
-                entry.time,
-                entry.user_id,
-                entry.amount,
-                entry.food_id,
-                Long(entry.id),
-                entry.measure_id,
-                0,
-                0,
-            ),
-        )
+    def _servings(diary: dict[str, Any]) -> list[DiaryEntry]:
+        entries = [
+            DiaryEntry.from_api(e)
+            for e in diary.get("diary") or []
+            if isinstance(e, dict) and e.get("type") == "Serving" and "servingId" in e
+        ]
+        return sorted(entries, key=lambda e: (e.time, e.group, e.order))
 
     def get_diary(self, day: dt.date | None = None) -> list[DiaryEntry]:
         """Return the food servings logged on ``day`` (default today), oldest first."""
-        session = self._require_session()
-        day = day or dt.date.today()
-        body = self._gwt_rpc("getDayInfo", self._sesnonce(session), day, session.user_id)
-        return sorted(self._servings_in(body), key=lambda e: (e.time, e.order))
+        return self._servings(self.get_diary_raw(day))
+
+    @staticmethod
+    def _entries_of_type(diary: dict[str, Any], kind: str, id_key: str) -> list[dict[str, Any]]:
+        return [
+            e
+            for e in diary.get("diary") or []
+            if isinstance(e, dict) and e.get("type") == kind and e.get(id_key) is not None
+        ]
+
+    def get_day(self, day: dt.date | None = None) -> DayDiary:
+        """Return servings, exercises, biometrics and calories for ``day`` in one request."""
+        day = day or self.today()
+        raw = self.get_diary_raw(day)
+        summary = raw.get("summary") or {}
+        try:
+            calories: CalorieSummary | None = CalorieSummary.from_summary(day, summary)
+        except ValueError:
+            calories = None
+        return DayDiary(
+            day=day,
+            servings=self._servings(raw),
+            exercises=sorted(
+                (
+                    ExerciseEntry.from_api(e)
+                    for e in self._entries_of_type(raw, "Exercise", "exerciseId")
+                ),
+                key=lambda e: e.time,
+            ),
+            biometrics=sorted(
+                (
+                    BiometricEntry.from_api(e)
+                    for e in self._entries_of_type(raw, "Biometric", "biometricId")
+                ),
+                key=lambda e: e.time,
+            ),
+            calories=calories,
+        )
+
+    def get_calories(self, day: dt.date | None = None) -> CalorieSummary:
+        """Return consumed, burned and target kcal for ``day`` (default today)."""
+        day = day or self.today()
+        summary = self.get_diary_raw(day).get("summary") or {}
+        try:
+            return CalorieSummary.from_summary(day, summary)
+        except ValueError as exc:
+            raise CronometerError(str(exc)) from exc
+
+    def _entry_stamp(self, day: dt.date | None, time: dt.time | None) -> tuple[str, str]:
+        now = self.now()
+        day = day or now.date()
+        time = (time or now.time()).replace(microsecond=0)
+        return format_day(day), f"{time.hour}:{time.minute}:{time.second}"
+
+    def _created_id(self, endpoint: str, data: Any, *keys: str) -> int:
+        if isinstance(data, dict):
+            for key in (*keys, "id"):
+                if data.get(key) is not None:
+                    return int(data[key])
+        raise CronometerError(f"{endpoint} returned no entry id: {data!r}")
+
+    def _delete_entries(self, entries: list[dict[str, Any]]) -> None:
+        """Delete diary entries of any type via the v3 endpoint.
+
+        The v3 deserializer rejects the ``meta`` object that ``get_diary``
+        attaches to biometric and exercise entries, so it is stripped.
+        """
+        body = {"diaryEntries": [{k: v for k, v in e.items() if k != "meta"} for e in entries]}
+        resp = self._v3("DELETE", "/diary-entries", json_body=body)
+        if resp.status_code not in (200, 204):
+            raise CronometerError(f"Delete failed with HTTP {resp.status_code}: {resp.text[:300]}")
+
+    def remove_entry(
+        self, entry_id: int, day: dt.date | None = None
+    ) -> DiaryEntry | BiometricEntry | ExerciseEntry:
+        """Delete the food, biometric or exercise entry ``entry_id`` on ``day`` (default today)."""
+        day = day or self.today()
+        diary = self.get_day(day)
+        found: list[DiaryEntry | BiometricEntry | ExerciseEntry] = [
+            *diary.servings,
+            *diary.exercises,
+            *diary.biometrics,
+        ]
+        match = next((e for e in found if e.id == entry_id), None)
+        if match is None:
+            raise CronometerError(f"No diary entry {entry_id} on {day.isoformat()}")
+        self._delete_entries([match.raw])
+        return match
 
     def add_food(
         self,
@@ -427,152 +407,220 @@ class CronometerClient:
         group: DiaryGroup = DiaryGroup.UNCATEGORIZED,
         day: dt.date | None = None,
         time: dt.time | None = None,
+        translation_id: int = 0,
     ) -> DiaryEntry:
-        """Log ``amount`` of ``measure_id`` of food ``food_id`` and return the created entry."""
+        """Log ``amount`` units of ``measure_id`` of food ``food_id`` and return the entry.
+
+        ``UNCATEGORIZED`` picks the meal group from the time of day, as the
+        app does. The measure's weight is looked up to convert ``amount`` to
+        grams.
+        """
         session = self._require_session()
-        now = dt.datetime.now()
-        day = day or now.date()
-        siblings = [e.order for e in self.get_diary(day) if e.group == group]
-        entry = DiaryEntry(
-            id=0,
-            day=day,
-            time=(time or now.time()).replace(microsecond=0),
-            group=group,
-            order=max(siblings, default=0) + 1,
-            food_id=food_id,
-            measure_id=measure_id,
-            amount=amount,
-            user_id=0,
+        food = self.get_food(food_id)
+        measure = food.measure(measure_id)
+        if measure is None:
+            raise CronometerError(
+                f"Food {food_id} has no measure {measure_id}; "
+                f"available: {', '.join(f'{m.id} ({m.name})' for m in food.measures)}"
+            )
+        now = self.now()
+        time = (time or now.time()).replace(microsecond=0)
+        if group == DiaryGroup.UNCATEGORIZED:
+            group = DiaryGroup.for_hour(time.hour)
+        day_str, time_str = self._entry_stamp(day, time)
+        serving = {
+            "order": (int(group) << 16) | 1,
+            "day": day_str,
+            "time": time_str,
+            "offset": None,
+            "source": None,
+            "userId": session.user_id,
+            "servingId": None,
+            "type": "Serving",
+            "foodId": food_id,
+            "measureId": measure_id,
+            "grams": measure.grams * amount,
+            "translationId": translation_id,
+        }
+        data = self._post(
+            "/api/v2/add_serving", {"serving": serving, "config": {"call_version": 2}}
         )
-        change = GwtObject(gwt.TYPE_ADD_ENTRY, (True, True, self._serving_object(entry)))
-        body = self._gwt_rpc(
-            "updateDiary", self._sesnonce(session), session.user_id, gwt.gwt_list([change])
-        )
-        created = self._servings_in(body)
-        if not created:
-            raise CronometerError(f"updateDiary returned no entry: {body[:200]}")
-        return created[0]
+        if not isinstance(data, dict):
+            raise CronometerError(f"add_serving returned unexpected response: {data!r}")
+        created = data.get("serving") if isinstance(data.get("serving"), dict) else data
+        if created.get("servingId") is None and created.get("id") is not None:
+            created = {**created, "servingId": created["id"]}
+        if created.get("servingId") is None:
+            raise CronometerError(f"add_serving returned no entry id: {data!r}")
+        return DiaryEntry.from_api({**serving, **created})
 
     def remove_food(self, entry_id: int, day: dt.date | None = None) -> DiaryEntry:
-        """Delete the diary entry ``entry_id`` logged on ``day`` (default today)."""
-        session = self._require_session()
+        """Delete the food serving ``entry_id`` logged on ``day`` (default today)."""
+        day = day or self.today()
         entries = [e for e in self.get_diary(day) if e.id == entry_id]
         if not entries:
-            raise CronometerError(
-                f"No diary entry {entry_id} on {(day or dt.date.today()).isoformat()}"
-            )
-        change = GwtObject(gwt.TYPE_DELETE_ENTRY, (self._serving_object(entries[0]),))
-        body = self._gwt_rpc(
-            "updateDiary", self._sesnonce(session), session.user_id, gwt.gwt_list([change])
-        )
-        self._gwt_decode(gwt.decode_response, body)
+            raise CronometerError(f"No diary entry {entry_id} on {day.isoformat()}")
+        self._delete_entries([entries[0].raw])
         return entries[0]
 
-    # -- foods ---------------------------------------------------------------
+    def get_metrics(self) -> list[Metric]:
+        """Return the catalog of trackable biometrics and their units."""
+        data = self._post("/api/v2/get_metrics", {"config": {"call_version": 1}})
+        metrics = data.get("metrics", []) if isinstance(data, dict) else []
+        return [Metric.from_api(m) for m in metrics if isinstance(m, dict) and "id" in m]
 
-    @staticmethod
-    def _parse_foods(reader: gwt.GwtReader) -> dict[int, FoodInfo]:
-        """Pull name, per-100g energy and measures for each ``Food`` in a response.
-
-        Walks the token stream looking for ``Measure`` and ``Nutrient`` objects
-        (fixed layouts) instead of deserializing the whole ``Food`` graph.
-        Measures carry their food id; a food's nutrient map follows its measures.
-        """
-        food_t = reader.type_index(gwt.TYPE_FOOD)
-        measure_t = reader.type_index(gwt.TYPE_MEASURE)
-        nutrient_t = reader.type_index(gwt.TYPE_NUTRIENT)
-        toks = reader.tokens
-        names: dict[int, str] = {}
-        measures: dict[int, list[Measure]] = {}
-        energy: dict[int, float] = {}
-        current: int | None = None
-        i = 0
-        while i < len(toks) - 12:
-            t = toks[i]
-            if t == food_t:
-                # Food: int, bool, list(type, size), int, name, ..., id. Only when the
-                # list is empty do the name and id sit at fixed offsets +6 and +9.
-                name, fid = toks[i + 6], toks[i + 9]
-                if (
-                    isinstance(name, int)
-                    and isinstance(fid, int)
-                    and 0 < name <= len(reader.strings)
-                    and fid > 0
-                ):
-                    names[fid] = reader.strings[name - 1]
-            elif t == measure_t and isinstance(toks[i + 1], float):
-                # Measure: quantity, bool, food id, bool, id, Double|null (volume in ml),
-                # name, HashMap (type, size), Measure$Type (type+ordinal or back-ref), grams
-                quantity, food_id, mid = toks[i + 1], toks[i + 3], toks[i + 5]
-                j = i + 6
-                j += 2 if toks[j] > 0 else 1
-                name_idx = toks[j]
-                j += 1  # HashMap type
-                if toks[j + 1] != 0:  # non-empty attribute map: layout unknown, skip measure
-                    i += 1
-                    continue
-                j += 2
-                j += 2 if toks[j] > 0 else 1
-                grams = float(toks[j])
-                current = food_id
-                measures.setdefault(food_id, []).append(
-                    Measure(mid, reader.strings[name_idx - 1], float(quantity), grams)
-                )
-                i = j + 1
-                continue
-            elif t == nutrient_t and toks[i + 2] == gwt.NUTRIENT_ENERGY and current is not None:
-                energy[current] = float(toks[i + 1])
-            i += 1
-        return {
-            fid: FoodInfo(fid, names.get(fid, ""), energy.get(fid), tuple(ms))
-            for fid, ms in measures.items()
-        }
-
-    def get_foods(self, food_ids: list[int]) -> dict[int, FoodInfo]:
-        """Fetch measures and energy for several foods via ``getAllFood``.
-
-        The server rejects more than :data:`FOODS_PER_REQUEST` ids per call, so
-        larger lists are split into several requests.
-        """
-        unique = list(dict.fromkeys(food_ids))
-        if not unique:
-            return {}
-        session = self._require_session()
-        hashes = self._gwt_hashes()
-        sesnonce = self._sesnonce(session)
-        foods: dict[int, FoodInfo] = {}
-        for start in range(0, len(unique), FOODS_PER_REQUEST):
-            chunk = unique[start : start + FOODS_PER_REQUEST]
-            ids = GwtObject(gwt.TYPE_ARRAY_LIST, (len(chunk), *(Boxed(i) for i in chunk)))
-            body = self._gwt_rpc("getAllFood", sesnonce, ids, hashes=hashes)
-            foods.update(self._parse_foods(self._gwt_decode(gwt.GwtReader, body)))
-        return foods
-
-    def get_food(self, food_id: int) -> FoodInfo:
-        foods = self.get_foods([food_id])
-        if food_id not in foods:
-            raise CronometerError(f"Food {food_id} not found")
-        return foods[food_id]
-
-    def search(
+    def get_biometrics(
         self,
-        query: str,
-        max_results: int = 50,
-        sources: Source = Source.ALL,
-    ) -> Any:
-        session = self._require_session()
-        resp = self._http.get(
-            f"/api/v3/user/{session.user_id}/food-search/string",
-            params={
-                "query": query,
-                "maxResults": max_results,
-                "sources": Source(sources).value,
-                "categoryId": 0,
-                "selectedTab": "ALL",
-                "type": "All",
+        metric_id: int,
+        unit_id: int,
+        start: dt.date | None = None,
+        end: dt.date | None = None,
+    ) -> list[BiometricPoint]:
+        """Return the ``metric_id`` series in ``unit_id`` between ``start`` and ``end``.
+
+        ``end`` defaults to today and ``start`` to 30 days before ``end``.
+        """
+        end = end or self.today()
+        start = start or end - dt.timedelta(days=30)
+        data = self._post(
+            "/api/v2/get_biometrics",
+            {
+                "metricId": metric_id,
+                "unitId": unit_id,
+                "start": format_day(start),
+                "end": format_day(end),
+                "config": {"call_version": 1},
             },
         )
-        if resp.status_code in (401, 403):
-            raise NotAuthenticatedError("Session expired. Log in again.")
-        resp.raise_for_status()
-        return resp.json()
+        points = data.get("data", []) if isinstance(data, dict) else []
+        return [
+            BiometricPoint(
+                day=parse_day(p["day"]),
+                value=float(p["value"]),
+                time=parse_time(p["time"]) if p.get("time") else None,
+            )
+            for p in points
+            if isinstance(p, dict) and "day" in p and "value" in p
+        ]
+
+    def add_biometric(
+        self,
+        metric_id: int,
+        unit_id: int,
+        amount: float,
+        *,
+        day: dt.date | None = None,
+        time: dt.time | None = None,
+    ) -> BiometricEntry:
+        """Log a biometric reading (``POST /api/v2/add_biometric``) and return the entry."""
+        session = self._require_session()
+        day_str, time_str = self._entry_stamp(day, time)
+        biometric = {
+            "type": "Biometric",
+            "metricId": metric_id,
+            "unitId": unit_id,
+            "amount": amount,
+            "day": day_str,
+            "time": time_str,
+            "order": 1,
+            "userId": session.user_id,
+            "biometricId": None,
+            "source": None,
+            "externalId": None,
+            "offset": None,
+            "samplesVersion": 0,
+            "meta": {},
+        }
+        data = self._post(
+            "/api/v2/add_biometric", {"biometric": biometric, "config": {"call_version": 1}}
+        )
+        entry_id = self._created_id("add_biometric", data, "biometricId")
+        return BiometricEntry.from_api({**biometric, "biometricId": entry_id})
+
+    def add_weight(
+        self, kg: float, *, day: dt.date | None = None, time: dt.time | None = None
+    ) -> BiometricEntry:
+        """Log body weight in kilograms."""
+        return self.add_biometric(METRIC_WEIGHT, UNIT_KG, kg, day=day, time=time)
+
+    def add_body_fat(
+        self, percent: float, *, day: dt.date | None = None, time: dt.time | None = None
+    ) -> BiometricEntry:
+        """Log body fat percentage."""
+        return self.add_biometric(METRIC_BODY_FAT, UNIT_PERCENT, percent, day=day, time=time)
+
+    def find_activity(self, query: str) -> list[Activity]:
+        """Search Cronometer's exercise activity catalog."""
+        data = self._post("/api/v2/find_activity", {"query": query, "config": {"call_version": 1}})
+        activities = data.get("activities", []) if isinstance(data, dict) else []
+        return [Activity.from_api(a) for a in activities if isinstance(a, dict) and "id" in a]
+
+    def add_exercise(
+        self,
+        name: str,
+        minutes: float,
+        kcal_burned: float,
+        *,
+        activity_id: int = 0,
+        day: dt.date | None = None,
+        time: dt.time | None = None,
+    ) -> ExerciseEntry:
+        """Log an exercise (``POST /api/v2/add_exercise``) burning ``kcal_burned`` kcal.
+
+        The calorie value is sent as an override, so Cronometer uses it as-is.
+        """
+        session = self._require_session()
+        day_str, time_str = self._entry_stamp(day, time)
+        exercise = {
+            "type": "Exercise",
+            "name": name,
+            "minutes": minutes,
+            "calories": -abs(kcal_burned),
+            "calorieOverride": True,
+            "activityId": activity_id,
+            "activitySpecId": 0,
+            "weight": 0,
+            "exerciseId": None,
+            "day": day_str,
+            "time": time_str,
+            "order": 1,
+            "userId": session.user_id,
+            "source": None,
+            "externalId": None,
+        }
+        data = self._post(
+            "/api/v2/add_exercise", {"exercise": exercise, "config": {"call_version": 1}}
+        )
+        entry_id = self._created_id("add_exercise", data, "exerciseId")
+        return ExerciseEntry.from_api({**exercise, "exerciseId": entry_id})
+
+    def get_profile(self) -> dict[str, Any]:
+        """Return the raw ``get_profile`` response (weight, height, prefs, history...)."""
+        data = self._post("/api/v2/get_profile", {"config": {"call_version": 1}})
+        return data if isinstance(data, dict) else {}
+
+    def get_preferences(self) -> dict[str, Any]:
+        """Return profile ``prefs`` flattened into one dict."""
+        prefs: dict[str, Any] = {}
+        for item in self.get_profile().get("prefs") or []:
+            if isinstance(item, dict):
+                prefs.update(item)
+        return prefs
+
+    def get_weight_goal(self) -> WeightGoal:
+        """Return the weight goal: weekly rate, target weight and latest logged weight."""
+        profile = self.get_profile()
+        prefs: dict[str, Any] = {}
+        for item in profile.get("prefs") or []:
+            if isinstance(item, dict):
+                prefs.update(item)
+        rate = prefs.get("weightGoal")
+        target = prefs.get("wgkg")
+        weight = profile.get("weight")
+        weight_date = profile.get("weightDate")
+        return WeightGoal(
+            rate_lb_per_week=float(rate) if rate not in (None, "") else 0.0,
+            target_kg=float(target) if target not in (None, "") else None,
+            current_kg=float(weight) if weight is not None else None,
+            weight_date=parse_day(weight_date) if weight_date else None,
+        )

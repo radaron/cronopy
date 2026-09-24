@@ -1,5 +1,3 @@
-"""Unofficial command line interface for Cronometer."""
-
 from __future__ import annotations
 
 import datetime as dt
@@ -13,7 +11,18 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from cronopy.client import CronometerClient, CronometerError, NotAuthenticatedError
-from cronopy.models import DiaryEntry, DiaryGroup, FoodInfo, Source
+from cronopy.enums import DiaryGroup, Source
+from cronopy.models import (
+    METRIC_BODY_FAT,
+    METRIC_WEIGHT,
+    UNIT_KG,
+    UNIT_LBS,
+    UNIT_PERCENT,
+    BiometricPoint,
+    DiaryEntry,
+    ExerciseEntry,
+    FoodInfo,
+)
 from cronopy.session import default_session_path, delete_session, load_session, save_session
 
 app = typer.Typer(
@@ -83,31 +92,34 @@ def login(
             help="Account password (prompted if omitted).",
         ),
     ],
+    totp_secret: Annotated[
+        str | None,
+        typer.Option(
+            "--totp-secret",
+            "-t",
+            envvar="CRONOPY_TOTP_SECRET",
+            help="Base32 2FA key shown by Cronometer when two-factor auth was set up.",
+        ),
+    ] = None,
 ) -> None:
     """Log in and store the session for later commands."""
     try:
-        with CronometerClient(email=email, password=password) as client:
+        with CronometerClient(email=email, password=password, totp_secret=totp_secret) as client:
             session = client.login()
     except CronometerError as exc:
         _fail(str(exc))
     path = save_session(session)
-    console.print(f"[green]Logged in[/green] as {session.email} (user id {session.user_id}).")
+    tz = f", tz {session.timezone}" if session.timezone else ""
+    console.print(f"[green]Logged in[/green] as {session.email} (user id {session.user_id}{tz}).")
     console.print(f"Session saved to [dim]{path}[/dim]")
 
 
 @app.command()
 def logout() -> None:
-    """Invalidate the remote session and remove the stored one."""
-    session = load_session()
-    if session is None:
+    """Remove the stored session (the mobile API has no remote logout)."""
+    if not delete_session():
         console.print("Not logged in; nothing to do.")
         return
-    try:
-        with CronometerClient(session) as client:
-            client.logout()
-    except CronometerError as exc:
-        err_console.print(f"[yellow]Warning:[/yellow] remote logout failed: {exc}")
-    delete_session()
     console.print("[green]Logged out.[/green] Stored session removed.")
 
 
@@ -118,7 +130,8 @@ def whoami() -> None:
     if session is None:
         console.print("Not logged in.")
         raise typer.Exit(1)
-    console.print(f"{session.email or '<unknown>'} (user id {session.user_id})")
+    tz = f", tz {session.timezone}" if session.timezone else ""
+    console.print(f"{session.email or '<unknown>'} (user id {session.user_id}{tz})")
     console.print(f"[dim]{default_session_path()}[/dim]")
 
 
@@ -148,8 +161,6 @@ def search(
         with _client_from_disk() as client:
             results = client.search(query, max_results=limit, sources=sources)
             foods = {} if as_json else _food_infos(client, results)
-            if (updated := client.refresh_session()) is not None:
-                save_session(updated)
     except NotAuthenticatedError as exc:
         _fail(str(exc))
     except CronometerError as exc:
@@ -176,7 +187,7 @@ def search(
         kcal = food.kcal(item.get("measureId", -1)) if food else None
         table.add_row(
             str(item.get("id", "")),
-            item.get("displayString") or item.get("name", ""),
+            str(item.get("name", "")),
             str(item.get("type", "")),
             str(item.get("source", "")),
             str(item.get("measureDisplayName", "")),
@@ -195,8 +206,6 @@ def food(
     try:
         with _client_from_disk() as client:
             info = client.get_food(food_id)
-            if (updated := client.refresh_session()) is not None:
-                save_session(updated)
     except CronometerError as exc:
         _fail(str(exc))
     if as_json:
@@ -205,12 +214,13 @@ def food(
     per100 = f"{info.kcal_per_100g:.0f} kcal / 100 g" if info.kcal_per_100g is not None else ""
     table = Table(title=f"{info.name or food_id} ({per100})")
     table.add_column("Measure ID", justify="right", style="cyan", no_wrap=True)
-    table.add_column("Measure")
+    table.add_column("Measure (default in bold)")
     table.add_column("Grams", justify="right")
     table.add_column("kcal", justify="right")
     for m in info.measures:
         kcal = info.kcal(m.id)
-        table.add_row(str(m.id), m.label, f"{m.grams:g}", f"{kcal:.0f}" if kcal is not None else "")
+        name = f"[bold]{m.name}[/bold]" if m.id == info.default_measure_id else m.name
+        table.add_row(str(m.id), name, f"{m.grams:g}", f"{kcal:.0f}" if kcal is not None else "")
     console.print(table)
 
 
@@ -226,13 +236,11 @@ def calories(
         bool, typer.Option("--json", help="Print raw JSON instead of a table.")
     ] = False,
 ) -> None:
-    """Show calories consumed, burned and remaining for a day."""
+    """Show calories consumed, target and remaining for a day."""
     day = date.date() if date else dt.date.today()
     try:
         with _client_from_disk() as client:
             summary = client.get_calories(day)
-            if (updated := client.refresh_session()) is not None:
-                save_session(updated)
     except NotAuthenticatedError as exc:
         _fail(str(exc))
     except CronometerError as exc:
@@ -250,10 +258,6 @@ def calories(
     table.add_row("  BMR", f"[dim]{summary.bmr:.0f}[/dim]")
     table.add_row("  Activity", f"[dim]{summary.activity:.0f}[/dim]")
     table.add_row("  Exercise", f"[dim]{summary.exercise:.0f}[/dim]")
-    if summary.custom_target is not None:
-        table.add_row("Custom target", f"{summary.custom_target:.0f}")
-    else:
-        table.add_row("Weight goal", f"{summary.weight_goal_adjustment:+.0f}")
     table.add_row("Target", f"{summary.target:.0f}")
     style = "green" if summary.remaining >= 0 else "red"
     table.add_row("[bold]Remaining[/bold]", f"[bold {style}]{summary.remaining:.0f}[/bold {style}]")
@@ -273,7 +277,7 @@ def _entries_table(day: dt.date, entries: list[DiaryEntry]) -> Table:
     table.add_column("Group", style="magenta")
     table.add_column("Food ID", justify="right")
     table.add_column("Measure ID", justify="right", style="dim")
-    table.add_column("Amount", justify="right")
+    table.add_column("Grams", justify="right")
     for e in entries:
         table.add_row(
             str(e.id),
@@ -281,7 +285,7 @@ def _entries_table(day: dt.date, entries: list[DiaryEntry]) -> Table:
             e.group.name.capitalize(),
             str(e.food_id),
             str(e.measure_id),
-            f"{e.amount:g}",
+            f"{e.grams:g}",
         )
     return table
 
@@ -290,22 +294,56 @@ def _entries_table(day: dt.date, entries: list[DiaryEntry]) -> Table:
 def diary(
     date: DateOption = None, as_json: Annotated[bool, typer.Option("--json")] = False
 ) -> None:
-    """List the food servings logged on a day."""
+    """List the food servings, exercises and biometrics logged on a day."""
     day = date.date() if date else dt.date.today()
     try:
         with _client_from_disk() as client:
-            entries = client.get_diary(day)
-            if (updated := client.refresh_session()) is not None:
-                save_session(updated)
+            diary = client.get_day(day)
     except CronometerError as exc:
         _fail(str(exc))
+    servings, exercises, biometrics = diary.servings, diary.exercises, diary.biometrics
     if as_json:
-        console.print_json(json.dumps([e.to_dict() for e in entries]))
+        console.print_json(json.dumps(diary.to_dict()))
         return
-    if not entries:
+    if not servings and not exercises and not biometrics:
         console.print(f"No entries on {day.isoformat()}.")
         return
-    console.print(_entries_table(day, entries))
+    if servings:
+        console.print(_entries_table(day, servings))
+    if exercises:
+        table = Table(title=f"Exercise for {day.isoformat()}")
+        table.add_column("Entry ID", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Time")
+        table.add_column("Name")
+        table.add_column("Minutes", justify="right")
+        table.add_column("kcal", justify="right")
+        for e in exercises:
+            table.add_row(
+                str(e.id),
+                e.time.strftime("%H:%M"),
+                e.name,
+                f"{e.minutes:g}",
+                f"{e.kcal_burned:.0f}",
+            )
+        console.print(table)
+    if biometrics:
+        table = Table(title=f"Biometrics for {day.isoformat()}")
+        table.add_column("Entry ID", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Time")
+        table.add_column("Metric ID", justify="right")
+        table.add_column("Unit ID", justify="right", style="dim")
+        table.add_column("Value", justify="right")
+        table.add_column("Source", style="dim")
+        for b in biometrics:
+            table.add_row(
+                str(b.id),
+                b.time.strftime("%H:%M"),
+                str(b.metric_id),
+                str(b.unit_id),
+                f"{b.amount:g}",
+                b.source or "",
+            )
+        console.print(table)
 
 
 @app.command()
@@ -316,7 +354,10 @@ def add(
         int, typer.Option("--measure", "-m", help="Measure id (`measureId` in search --json).")
     ],
     group: Annotated[
-        str, typer.Option("--group", "-g", help="uncategorized|breakfast|lunch|dinner|snacks")
+        str,
+        typer.Option(
+            "--group", "-g", help="breakfast|lunch|dinner|snacks (default: by time of day)"
+        ),
     ] = "uncategorized",
     time: Annotated[
         dt.datetime | None,
@@ -341,12 +382,10 @@ def add(
                 day=date.date() if date else None,
                 time=time.time() if time else None,
             )
-            if (updated := client.refresh_session()) is not None:
-                save_session(updated)
     except CronometerError as exc:
         _fail(str(exc))
     console.print(
-        f"[green]Added[/green] entry {entry.id}: food {entry.food_id} x {entry.amount:g} "
+        f"[green]Added[/green] entry {entry.id}: food {entry.food_id}, {entry.grams:g} g "
         f"to {entry.group.name.capitalize()} at {entry.time.strftime('%H:%M')} on {entry.day}."
     )
 
@@ -356,17 +395,249 @@ def remove(
     entry_id: Annotated[int, typer.Argument(help="Entry id (see `crono diary`).")],
     date: DateOption = None,
 ) -> None:
-    """Remove a food serving from the diary."""
+    """Remove a food, exercise or biometric entry from the diary."""
     try:
         with _client_from_disk() as client:
-            entry = client.remove_food(entry_id, date.date() if date else None)
-            if (updated := client.refresh_session()) is not None:
-                save_session(updated)
+            entry = client.remove_entry(entry_id, date.date() if date else None)
+    except CronometerError as exc:
+        _fail(str(exc))
+    if isinstance(entry, DiaryEntry):
+        what = f"food {entry.food_id}, {entry.grams:g} g"
+    elif isinstance(entry, ExerciseEntry):
+        what = f"exercise {entry.name!r}, {entry.minutes:g} min"
+    else:
+        what = f"biometric metric {entry.metric_id} = {entry.amount:g}"
+    console.print(f"[green]Removed[/green] entry {entry.id} ({what}).")
+
+
+TimeOption = Annotated[
+    dt.datetime | None,
+    typer.Option("--time", "-t", formats=["%H:%M", "%H:%M:%S"], help="Time (default now)."),
+]
+
+
+def _stamp(
+    date: dt.datetime | None, time: dt.datetime | None
+) -> tuple[dt.date | None, dt.time | None]:
+    return (date.date() if date else None, time.time() if time else None)
+
+
+@app.command()
+def metrics(
+    query: Annotated[str | None, typer.Argument(help="Filter metrics by name.")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """List trackable biometrics with their metric and unit ids."""
+    try:
+        with _client_from_disk() as client:
+            found = client.get_metrics()
+    except CronometerError as exc:
+        _fail(str(exc))
+    if query:
+        found = [m for m in found if query.lower() in m.name.lower()]
+    if as_json:
+        console.print_json(json.dumps([m.to_dict() for m in found]))
+        return
+    table = Table(title="Biometric metrics")
+    table.add_column("Metric ID", justify="right", style="cyan", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Units (id)")
+    for m in found:
+        table.add_row(str(m.id), m.name, ", ".join(f"{u.name} ({u.id})" for u in m.units))
+    console.print(table)
+
+
+@app.command()
+def weight(
+    value: Annotated[float, typer.Argument(help="Body weight.")],
+    lbs: Annotated[bool, typer.Option("--lbs", help="Value is in pounds instead of kg.")] = False,
+    date: DateOption = None,
+    time: TimeOption = None,
+) -> None:
+    """Log body weight."""
+    day, at = _stamp(date, time)
+    try:
+        with _client_from_disk() as client:
+            entry = client.add_biometric(
+                METRIC_WEIGHT, UNIT_LBS if lbs else UNIT_KG, value, day=day, time=at
+            )
+    except CronometerError as exc:
+        _fail(str(exc))
+    unit = "lbs" if lbs else "kg"
+    console.print(
+        f"[green]Logged[/green] weight {value:g} {unit} on {entry.day} (entry {entry.id})."
+    )
+
+
+@app.command()
+def bodyfat(
+    percent: Annotated[float, typer.Argument(help="Body fat percentage.")],
+    date: DateOption = None,
+    time: TimeOption = None,
+) -> None:
+    """Log body fat percentage."""
+    day, at = _stamp(date, time)
+    try:
+        with _client_from_disk() as client:
+            entry = client.add_body_fat(percent, day=day, time=at)
+    except CronometerError as exc:
+        _fail(str(exc))
+    console.print(f"[green]Logged[/green] body fat {percent:g}% on {entry.day} (entry {entry.id}).")
+
+
+@app.command()
+def biometric(
+    metric_id: Annotated[int, typer.Argument(help="Metric id (see `crono metrics`).")],
+    unit_id: Annotated[int, typer.Argument(help="Unit id (see `crono metrics`).")],
+    value: Annotated[float, typer.Argument(help="Reading.")],
+    date: DateOption = None,
+    time: TimeOption = None,
+) -> None:
+    """Log any biometric reading."""
+    day, at = _stamp(date, time)
+    try:
+        with _client_from_disk() as client:
+            entry = client.add_biometric(metric_id, unit_id, value, day=day, time=at)
     except CronometerError as exc:
         _fail(str(exc))
     console.print(
-        f"[green]Removed[/green] entry {entry.id} (food {entry.food_id} x {entry.amount:g})."
+        f"[green]Logged[/green] metric {metric_id} = {value:g} (unit {unit_id}) on {entry.day} "
+        f"(entry {entry.id})."
     )
+
+
+@app.command()
+def biometrics(
+    metric_id: Annotated[
+        int | None,
+        typer.Argument(help="Metric id (see `crono metrics`). Default: weight + body fat."),
+    ] = None,
+    unit_id: Annotated[
+        int | None, typer.Option("--unit", "-u", help="Unit id (default: metric's first unit).")
+    ] = None,
+    days: Annotated[int, typer.Option("--days", "-n", min=1, help="Days back from today.")] = 30,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show biometric history: weight (kg) and body fat (%) by default, or one metric."""
+    series: list[tuple[str, int, int]] = (
+        [("Weight (kg)", METRIC_WEIGHT, UNIT_KG), ("Body fat (%)", METRIC_BODY_FAT, UNIT_PERCENT)]
+        if metric_id is None
+        else [(f"Metric {metric_id}", metric_id, unit_id or 0)]
+    )
+    try:
+        with _client_from_disk() as client:
+            end = client.today()
+            start = end - dt.timedelta(days=days)
+            if metric_id is not None and unit_id is None:
+                metric = next((m for m in client.get_metrics() if m.id == metric_id), None)
+                if metric is None or not metric.units:
+                    raise CronometerError(f"Unknown metric {metric_id}; see `crono metrics`.")
+                unit = metric.units[0]
+                series = [(f"{metric.name} ({unit.name})", metric.id, unit.id)]
+            columns = {
+                label: client.get_biometrics(mid, uid, start, end) for label, mid, uid in series
+            }
+    except CronometerError as exc:
+        _fail(str(exc))
+    if as_json:
+        console.print_json(
+            json.dumps({label: [p.to_dict() for p in pts] for label, pts in columns.items()})
+        )
+        return
+    if not any(columns.values()):
+        console.print(f"No readings in the last {days} days.")
+        return
+    by_day: dict[dt.date, dict[str, BiometricPoint]] = {}
+    for label, pts in columns.items():
+        for pt in pts:
+            by_day.setdefault(pt.day, {})[label] = pt
+    table = Table(title=f"Biometrics, last {days} days")
+    table.add_column("Day")
+    for label in columns:
+        table.add_column(label, justify="right")
+    for day in sorted(by_day):
+        table.add_row(
+            day.isoformat(),
+            *(f"{by_day[day][label].value:g}" if label in by_day[day] else "" for label in columns),
+        )
+    console.print(table)
+
+
+@app.command()
+def activities(
+    query: Annotated[str, typer.Argument(help="Activity name to search for.")],
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 25,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Search the exercise activity catalog."""
+    try:
+        with _client_from_disk() as client:
+            found = client.find_activity(query)[:limit]
+    except CronometerError as exc:
+        _fail(str(exc))
+    if as_json:
+        console.print_json(json.dumps([a.to_dict() for a in found]))
+        return
+    table = Table(title=f"Activities for “{query}”")
+    table.add_column("ID", justify="right", style="cyan", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Category", style="magenta")
+    for a in found:
+        table.add_row(str(a.id), a.name, a.category)
+    console.print(table)
+
+
+@app.command()
+def exercise(
+    name: Annotated[str, typer.Argument(help="Exercise name as shown in the diary.")],
+    minutes: Annotated[float, typer.Argument(help="Duration in minutes.")],
+    kcal: Annotated[float, typer.Argument(help="Calories burned.")],
+    activity_id: Annotated[
+        int, typer.Option("--activity", "-a", help="Activity id (see `crono activities`).")
+    ] = 0,
+    date: DateOption = None,
+    time: TimeOption = None,
+) -> None:
+    """Log an exercise with the calories it burned."""
+    day, at = _stamp(date, time)
+    try:
+        with _client_from_disk() as client:
+            entry = client.add_exercise(
+                name, minutes, kcal, activity_id=activity_id, day=day, time=at
+            )
+    except CronometerError as exc:
+        _fail(str(exc))
+    console.print(
+        f"[green]Logged[/green] {entry.name!r}: {entry.minutes:g} min, "
+        f"{entry.kcal_burned:.0f} kcal on {entry.day} (entry {entry.id})."
+    )
+
+
+@app.command()
+def goal(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Show the weight goal: weekly rate, target and latest weight."""
+    try:
+        with _client_from_disk() as client:
+            wg = client.get_weight_goal()
+    except CronometerError as exc:
+        _fail(str(exc))
+    if as_json:
+        console.print_json(json.dumps(wg.to_dict()))
+        return
+    table = Table(title="Weight goal", show_header=False)
+    table.add_column("Item")
+    table.add_column("Value", justify="right")
+    table.add_row(
+        "Rate", f"{wg.rate_kg_per_week:+.2f} kg/week ({wg.rate_lb_per_week:+.2f} lb/week)"
+    )
+    if wg.target_kg is not None:
+        table.add_row("Target", f"{wg.target_kg:g} kg")
+    if wg.current_kg is not None:
+        when = f" ({wg.weight_date.isoformat()})" if wg.weight_date else ""
+        table.add_row("Current", f"{wg.current_kg:g} kg{when}")
+    if wg.to_go_kg is not None:
+        table.add_row("[bold]To go[/bold]", f"[bold]{wg.to_go_kg:.1f} kg[/bold]")
+    console.print(table)
 
 
 def main() -> None:

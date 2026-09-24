@@ -1,36 +1,17 @@
-"""Persistent session storage for the Cronometer CLI."""
-
 from __future__ import annotations
 
 import contextlib
 import json
 import os
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from cronopy.models import Session
 
 
 def default_session_path() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
     root = Path(base) if base else Path.home() / ".config"
     return root / "cronopy" / "session.json"
-
-
-@dataclass
-class Session:
-    user_id: int
-    email: str | None = None
-    cookies: dict[str, str] = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> Session:
-        return cls(
-            user_id=int(data["user_id"]),
-            email=data.get("email"),
-            cookies=dict(data.get("cookies") or {}),
-        )
 
 
 def load_session(path: Path | None = None) -> Session | None:
