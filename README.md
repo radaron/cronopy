@@ -1,7 +1,13 @@
 # cronopy
 
 Unofficial cli for cronometer, built on the JSON REST API used by the
-Cronometer mobile app (`mobile.cronometer.com`)
+Cronometer mobile app (`mobile.cronometer.com`).
+
+The idea and the API knowledge come from
+[rwestergren/cronometer-api-mcp](https://github.com/rwestergren/cronometer-api-mcp/tree/main),
+an MCP server that reverse-engineered the mobile endpoints. cronopy wraps the
+same API in a command line tool and a small Python library.
+
 ## Install
 
 ```sh
