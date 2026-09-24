@@ -1,0 +1,74 @@
+[project]
+name = "cronopy"
+version = "0.1.0"
+description = "Unofficial cli for cronometer"
+readme = "README.md"
+authors = [
+    { name = "Aron Radics", email = "radaron@radaron.hu" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "httpx>=0.28.1",
+    "rich>=15.0.0",
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+crono = "cronopy.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "respx>=0.23.1",
+    "ruff>=0.16.8",
+    "ty>=0.0.84",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "SIM",      # simplify
+    "ANN",      # flake8-annotations: every def needs full annotations
+    "RUF",      # ruff-specific
+    "PT",       # pytest style
+    "TID252",   # ban relative imports
+]
+ignore = [
+    "ANN401",   # allow typing.Any where it is genuinely dynamic (API JSON)
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["cronopy", "conftest"]
+combine-as-imports = true
+split-on-trailing-comma = false
+
+[tool.ruff.lint.flake8-annotations]
+allow-star-arg-any = true
+mypy-init-return = false   # __init__ must be annotated -> None too
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN"]       # test functions/fixtures need not be annotated
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
