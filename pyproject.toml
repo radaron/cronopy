@@ -1,6 +1,6 @@
 [project]
 name = "cronopy"
-version = "0.1.0"
+version = "0.1.1"
 description = "Unofficial cli for cronometer"
 readme = "README.md"
 authors = [
@@ -13,6 +13,11 @@ dependencies = [
     "rich>=15.0.0",
     "typer>=0.27.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/radaron/cronopy"
+Repository = "https://github.com/radaron/cronopy"
+Issues = "https://github.com/radaron/cronopy/issues"
 
 [project.scripts]
 crono = "cronopy.cli:main"
