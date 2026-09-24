@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any
 
 
@@ -61,4 +61,91 @@ class CalorieSummary:
             "custom_target": self.custom_target,
             "target": self.target,
             "remaining": self.remaining,
+        }
+
+
+class DiaryGroup(IntEnum):
+    """Diary category. Stored in the high 16 bits of a serving's ``order`` field."""
+
+    UNCATEGORIZED = 0
+    BREAKFAST = 1
+    LUNCH = 2
+    DINNER = 3
+    SNACKS = 4
+
+    @classmethod
+    def parse(cls, name: str) -> DiaryGroup:
+        return cls[name.strip().upper()]
+
+
+@dataclass(frozen=True)
+class DiaryEntry:
+    """One food serving logged in the diary."""
+
+    id: int
+    day: dt.date
+    time: dt.time
+    group: DiaryGroup
+    order: int
+    food_id: int
+    measure_id: int
+    amount: float
+    user_id: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "day": self.day.isoformat(),
+            "time": self.time.isoformat(),
+            "group": self.group.name.lower(),
+            "order": self.order,
+            "food_id": self.food_id,
+            "measure_id": self.measure_id,
+            "amount": self.amount,
+            "user_id": self.user_id,
+        }
+
+
+@dataclass(frozen=True)
+class Measure:
+    """A serving size of a food, e.g. ``1 cup`` weighing ``244`` grams."""
+
+    id: int
+    name: str
+    quantity: float
+    grams: float
+
+    @property
+    def label(self) -> str:
+        return f"{self.quantity:g} {self.name} - {self.grams:g}g"
+
+
+@dataclass(frozen=True)
+class FoodInfo:
+    """Food details: nutrients are stored per 100 g by Cronometer."""
+
+    id: int
+    name: str
+    kcal_per_100g: float | None
+    measures: tuple[Measure, ...]
+
+    def measure(self, measure_id: int) -> Measure | None:
+        return next((m for m in self.measures if m.id == measure_id), None)
+
+    def kcal(self, measure_id: int, amount: float = 1.0) -> float | None:
+        """Energy of ``amount`` units of ``measure_id``, or ``None`` if unknown."""
+        m = self.measure(measure_id)
+        if m is None or self.kcal_per_100g is None:
+            return None
+        return self.kcal_per_100g / 100 * m.grams * amount
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "kcal_per_100g": self.kcal_per_100g,
+            "measures": [
+                {"id": m.id, "name": m.name, "quantity": m.quantity, "grams": m.grams}
+                for m in self.measures
+            ],
         }

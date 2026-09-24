@@ -7,15 +7,23 @@ from conftest import POLICY_HASH, USER_ID
 from cronopy.gwt import (
     MODULE_BASE,
     SERVICE,
+    TYPE_ADD_ENTRY,
+    TYPE_SERVING,
     Boxed,
+    GwtObject,
     GwtParam,
     GwtProtocolError,
+    GwtReader,
     GwtRequest,
     GwtServerError,
+    Long,
     decode_int,
+    decode_long,
     decode_response,
     decode_string,
+    encode_long,
     encode_request,
+    gwt_list,
 )
 
 
@@ -86,3 +94,68 @@ def test_decode_int():
 def test_decode_string():
     assert decode_string('//OK[1,["-1.65"],0,7]') == "-1.65"
     assert decode_string("//OK[0,[],0,7]") is None
+
+
+UPDATE_DIARY_EXAMPLE = (
+    f"7|0|13|{MODULE_BASE}|{POLICY_HASH}|{SERVICE}|updateDiary|java.lang.String/2004016611|I|"
+    "java.util.List|1886e0feaa8433af4f7b63f5cff669c5|"
+    "java.util.Collections$SingletonList/1586180994|"
+    "com.cronometer.shared.entries.changes.AddEntryChange/3949104564|"
+    "com.cronometer.shared.entries.models.Serving/2553599101|"
+    "com.cronometer.shared.entries.models.Day/782579793|"
+    "com.cronometer.shared.entries.models.Time/1552252503|"
+    "1|2|3|4|3|5|6|7|8|17669754|9|10|1|1|11|12|24|9|2026|1|1|0|2|13|20|44|0|0|100|455715|A|1025057|0|0|"
+)
+
+
+def test_encode_update_diary_matches_captured_request():
+    serving = GwtObject(
+        TYPE_SERVING,
+        (
+            dt.date(2026, 9, 24),
+            True,
+            True,
+            None,
+            2,
+            dt.time(20, 44),
+            0,
+            100.0,
+            455715,
+            Long(0),
+            1025057,
+            0,
+            0,
+        ),
+    )
+    change = GwtObject(TYPE_ADD_ENTRY, (True, True, serving))
+    body = encode_request(
+        POLICY_HASH,
+        "updateDiary",
+        "1886e0feaa8433af4f7b63f5cff669c5",
+        17669754,
+        gwt_list([change]),
+    )
+    assert body == UPDATE_DIARY_EXAMPLE
+
+
+def test_gwt_list_of_many_uses_array_list():
+    body = encode_request(POLICY_HASH, "m", gwt_list([GwtObject("X/1"), GwtObject("X/1")]))
+    assert "|java.util.ArrayList/4159755760|" in body
+    assert body.endswith("|1|2|3|4|1|5|6|2|7|7|")
+
+
+@pytest.mark.parametrize(
+    ("value", "token"),
+    [(0, "A"), (5207895104, "E2aixA"), (63, "_"), (64, "BA"), (-1, "P__________")],
+)
+def test_long_roundtrip(value, token):
+    assert encode_long(value) == token
+    assert decode_long(token) == value
+
+
+def test_reader_walks_tokens_in_write_order():
+    r = GwtReader('//OK[3,2,1,["a","b"],0,7]')
+    assert r.strings == ["a", "b"]
+    assert r.type_index("b") == 2
+    assert r.type_index("zzz") is None
+    assert (r.read(), r.read_string(), r.read()) == (1, "b", 3)

@@ -14,8 +14,12 @@ uv sync
 crono login -e you@example.com      # password is prompted (or pass -p)
 crono search "chili" -n 10          # table output
 crono search "chili" --json         # raw JSON
+crono food 455715                   # measures of a food with grams and kcal
 crono calories                      # consumed / burned / remaining for today
 crono calories -d 2026-09-20 --json # another day, raw JSON
+crono diary                         # servings logged today (entry ids)
+crono add 455715 100 -m 1025057 -g breakfast -t 08:30   # food id, amount, measure id
+crono remove 5207940830             # entry id from `crono diary`
 crono whoami
 crono logout
 ```
