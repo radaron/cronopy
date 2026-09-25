@@ -1,6 +1,6 @@
 [project]
 name = "cronopy"
-version = "0.4.1"
+version = "0.4.2"
 description = "Unofficial cli for cronometer (mobile REST API)"
 readme = "README.md"
 authors = [

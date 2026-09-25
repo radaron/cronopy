@@ -33,10 +33,21 @@ app = typer.Typer(
 console = Console()
 log = logging.getLogger("cronopy.cli")
 err_console = Console(stderr=True)
+_state = {"json": False}
+
+
+def _json_mode() -> bool:
+    return _state["json"]
 
 
 @app.callback()
 def _root(
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json", "-j", help="Print raw JSON instead of tables.", envvar="CRONOPY_JSON"
+        ),
+    ] = False,
     debug: Annotated[
         bool,
         typer.Option(
@@ -47,6 +58,7 @@ def _root(
         ),
     ] = False,
 ) -> None:
+    _state["json"] = as_json
     if not debug:
         return
     logging.basicConfig(
@@ -152,21 +164,18 @@ def search(
     sources: Annotated[
         Source, typer.Option("--sources", "-s", help="Cronometer source filter.")
     ] = Source.ALL,
-    as_json: Annotated[
-        bool, typer.Option("--json", help="Print raw JSON instead of a table.")
-    ] = False,
 ) -> None:
     """Search foods, recipes and meals."""
     try:
         with _client_from_disk() as client:
             results = client.search(query, max_results=limit, sources=sources)
-            foods = {} if as_json else _food_infos(client, results)
+            foods = {} if _json_mode() else _food_infos(client, results)
     except NotAuthenticatedError as exc:
         _fail(str(exc))
     except CronometerError as exc:
         _fail(str(exc))
 
-    if as_json:
+    if _json_mode():
         console.print_json(json.dumps(results))
         return
 
@@ -200,7 +209,6 @@ def search(
 @app.command()
 def food(
     food_id: Annotated[int, typer.Argument(help="Food id (see `crono search`).")],
-    as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Show a food's measures with their weight and calories."""
     try:
@@ -208,7 +216,7 @@ def food(
             info = client.get_food(food_id)
     except CronometerError as exc:
         _fail(str(exc))
-    if as_json:
+    if _json_mode():
         console.print_json(json.dumps(info.to_dict()))
         return
     per100 = f"{info.kcal_per_100g:.0f} kcal / 100 g" if info.kcal_per_100g is not None else ""
@@ -232,9 +240,6 @@ def calories(
             "--date", "-d", formats=["%Y-%m-%d"], help="Day to report (YYYY-MM-DD, default today)."
         ),
     ] = None,
-    as_json: Annotated[
-        bool, typer.Option("--json", help="Print raw JSON instead of a table.")
-    ] = False,
 ) -> None:
     """Show calories consumed, target and remaining for a day."""
     day = date.date() if date else dt.date.today()
@@ -246,7 +251,7 @@ def calories(
     except CronometerError as exc:
         _fail(str(exc))
 
-    if as_json:
+    if _json_mode():
         console.print_json(json.dumps(summary.to_dict()))
         return
 
@@ -291,9 +296,7 @@ def _entries_table(day: dt.date, entries: list[DiaryEntry]) -> Table:
 
 
 @app.command()
-def diary(
-    date: DateOption = None, as_json: Annotated[bool, typer.Option("--json")] = False
-) -> None:
+def diary(date: DateOption = None) -> None:
     """List the food servings, exercises and biometrics logged on a day."""
     day = date.date() if date else dt.date.today()
     try:
@@ -302,7 +305,7 @@ def diary(
     except CronometerError as exc:
         _fail(str(exc))
     servings, exercises, biometrics = diary.servings, diary.exercises, diary.biometrics
-    if as_json:
+    if _json_mode():
         console.print_json(json.dumps(diary.to_dict()))
         return
     if not servings and not exercises and not biometrics:
@@ -425,7 +428,6 @@ def _stamp(
 @app.command()
 def metrics(
     query: Annotated[str | None, typer.Argument(help="Filter metrics by name.")] = None,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """List trackable biometrics with their metric and unit ids."""
     try:
@@ -435,7 +437,7 @@ def metrics(
         _fail(str(exc))
     if query:
         found = [m for m in found if query.lower() in m.name.lower()]
-    if as_json:
+    if _json_mode():
         console.print_json(json.dumps([m.to_dict() for m in found]))
         return
     table = Table(title="Biometric metrics")
@@ -516,7 +518,6 @@ def biometrics(
         int | None, typer.Option("--unit", "-u", help="Unit id (default: metric's first unit).")
     ] = None,
     days: Annotated[int, typer.Option("--days", "-n", min=1, help="Days back from today.")] = 30,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Show biometric history: weight (kg) and body fat (%) by default, or one metric."""
     series: list[tuple[str, int, int]] = (
@@ -539,7 +540,7 @@ def biometrics(
             }
     except CronometerError as exc:
         _fail(str(exc))
-    if as_json:
+    if _json_mode():
         console.print_json(
             json.dumps({label: [p.to_dict() for p in pts] for label, pts in columns.items()})
         )
@@ -567,7 +568,6 @@ def biometrics(
 def activities(
     query: Annotated[str, typer.Argument(help="Activity name to search for.")],
     limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 25,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Search the exercise activity catalog."""
     try:
@@ -575,7 +575,7 @@ def activities(
             found = client.find_activity(query)[:limit]
     except CronometerError as exc:
         _fail(str(exc))
-    if as_json:
+    if _json_mode():
         console.print_json(json.dumps([a.to_dict() for a in found]))
         return
     table = Table(title=f"Activities for “{query}”")
@@ -614,14 +614,14 @@ def exercise(
 
 
 @app.command()
-def goal(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+def goal() -> None:
     """Show the weight goal: weekly rate, target and latest weight."""
     try:
         with _client_from_disk() as client:
             wg = client.get_weight_goal()
     except CronometerError as exc:
         _fail(str(exc))
-    if as_json:
+    if _json_mode():
         console.print_json(json.dumps(wg.to_dict()))
         return
     table = Table(title="Weight goal", show_header=False)

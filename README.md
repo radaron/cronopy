@@ -20,10 +20,10 @@ uv sync
 crono login -e you@example.com      # password is prompted (or pass -p)
 crono login -e you@example.com -t "ABCD EFGH ..."   # account with 2FA: base32 TOTP key
 crono search "chili" -n 10          # table output
-crono search "chili" --json         # raw JSON
+crono --json search "chili"         # raw JSON (global flag, works with every command)
 crono food 455715                   # measures of a food with grams and kcal
 crono calories                      # consumed / target / remaining for today
-crono calories -d 2026-09-20 --json # another day, raw JSON
+crono calories -d 2026-09-20        # another day
 crono diary                         # servings logged today (entry ids)
 crono add 455715 100 -m 1025057 -g breakfast -t 08:30   # food id, amount, measure id
 crono remove 5207940830             # any entry id from `crono diary` (food, exercise, biometric)

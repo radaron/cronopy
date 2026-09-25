@@ -33,3 +33,5 @@ def live_client():
         pytest.skip("no CRONOMETER_EMAIL/PASSWORD and no saved `crono login` session")
     with client:
         yield client
+        client.logout()
+    assert not client.is_authenticated
